@@ -18,6 +18,17 @@ import matplotlib.pyplot as plt
 
 import json
 
+from pymachete.order import Order
+import time
+import datetime
+import logging
+from argparse import ArgumentParser 
+
+path = '/Users/tommy/HOVER/machine-learning/projects/auto_matcher/data'
+import sys
+sys.path.insert(0, path)
+from utils.info_loader import InfoLoader
+
 def show_matches(img1, img2, k1, k2, target_dim=800.):
     h1, w1 = img1.shape[:2]
     h2, w2 = img2.shape[:2]
@@ -149,12 +160,8 @@ def extract_multiscale( net, img, detector, scale_f=2**0.25,
     return XYS, D, scores
 
 
-def extract_keypoints(args, img_path):
+def extract_keypoints(args, net, img_path):
     iscuda = common.torch_set_gpu(args.gpu)
-
-    # load the network...
-    net = load_network(args.model)
-    if iscuda: net = net.cuda()
 
     # create the non-maxima detector
     detector = NonMaxSuppression(
@@ -188,9 +195,9 @@ def extract_keypoints(args, img_path):
 
     return imsize, keypoints, descriptors, scores
 
-def extract_pair(args, img1, img2):
-    size1, k1_raw, d1, s1 = extract_keypoints(args, img1)
-    size2, k2_raw, d2, s2 = extract_keypoints(args, img2)
+def extract_pair(args, net, img1, img2):
+    size1, k1_raw, d1, s1 = extract_keypoints(args, net, img1)
+    size2, k2_raw, d2, s2 = extract_keypoints(args, net, img2)
     matcher = AdalamFilter(custom_config={
     'scale_rate_threshold':None,
     'orientation_difference_threshold':None
@@ -203,7 +210,7 @@ def extract_pair(args, img1, img2):
                                       im2shape=size2).cpu().numpy()
     # canvas0 = cv2.imread(img1)
     # canvas1 = cv2.imread(img2)
-    #show_matches(canvas0, canvas1, k1=k1[matches[:, 0]], k2=k2[matches[:, 1]]) 
+    # show_matches(canvas0, canvas1, k1=k1[matches[:, 0]], k2=k2[matches[:, 1]]) 
 
     result = {}
     left_kps = [[int(kp[0]), int(kp[1])] for kp in k1]
@@ -231,7 +238,43 @@ class NPToJSONEncoder(json.JSONEncoder):
             return obj.tolist()
         else:
             return super(NPToJSONEncoder, self).default(obj)
-   
+
+def run_one_order(args, net, order_dir, order_id):
+    order = Order(order_dir, order_id)
+
+    with open(f"{order_dir}/{order_id}.metadata.json", 'r') as fd:
+        metadata = json.load(fd)
+
+    image_pairs_metadata = metadata['image_pairs_metadata']
+    if len(image_pairs_metadata) > 0:
+        r2d2_pred_dir = f'{order_dir}/predictions/r2d2'
+        os.makedirs(r2d2_pred_dir, exist_ok=True)
+
+        for pair_metadata in image_pairs_metadata.values():
+            result = {}
+            idl, idr = pair_metadata['image_id_pair']
+            camera_left, camera_right = order.get_camera(idl), order.get_camera(idr)
+
+            result = extract_pair(
+                args, net,
+                camera_left.image_path, 
+                camera_right.image_path)
+
+            save_file = f'{r2d2_pred_dir}/{idl}_{idr}.json'
+
+            with open(save_file, 'w') as outfile:
+                json.dump(result, outfile, cls=NPToJSONEncoder)
+                print(f"saved {save_file}")
+
+def run_all_orders(args, net, order_infos: dict):
+    start_time = time.time()
+    for order_id, order_info in order_infos.items():
+        run_one_order(args, net, order_info.order_dir, order_info.order_id)
+
+    time_used = time.time() - start_time
+    time_used = str(datetime.timedelta(seconds=time_used))[:-4]
+    logging.info(f"Time used {time_used}")
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser("Extract keypoints for a given image")
@@ -250,14 +293,24 @@ if __name__ == '__main__':
     parser.add_argument("--reliability-thr", type=float, default=0.7)
     parser.add_argument("--repeatability-thr", type=float, default=0.7)
 
+    parser.add_argument(
+        "-d",
+        "--data_folder",
+        type=str,
+        default="/Users/tommy/HOVER/machine-learning/projects/auto_matcher/data/orders",
+        help="Dataset folder",
+    )
+
     parser.add_argument("--gpu", type=int, nargs='+', default=-1, help='use -1 for CPU')
     args = parser.parse_args()
 
     img1 = './imgs/image_1883020_order_225988.jpg'
     img2 = './imgs/image_1883037_order_225988.jpg'
-    result = extract_pair(args, img1, img2)
-    save_file = f'test.json'
-    with open(save_file, 'w') as outfile:
-        json.dump(result, outfile, cls=NPToJSONEncoder)
-        print(f"saved {save_file}")
 
+    # load the network...
+    iscuda = common.torch_set_gpu(args.gpu)
+    net = load_network(args.model)
+    if iscuda: net = net.cuda()
+
+    order_infos = InfoLoader(args.data_folder).order_infos
+    run_all_orders(args, net, order_infos)
